@@ -2,16 +2,61 @@ require 'spec_helper'
 
 module Spree
   describe StockLocation do
-    subject { create(:stock_location_with_items) }
+    subject { create(:stock_location_with_items, backorderable_default: true) }
     let(:stock_item) { subject.stock_items.order(:id).first }
     let(:variant) { stock_item.variant }
 
-    before(:each) do
-      Spree::StockLocation.delete_all
-    end
-
     it 'creates stock_items for all variants' do
       subject.stock_items.count.should eq Variant.count
+    end
+
+    context "handling stock items" do
+      let!(:variant) { create(:variant) }
+
+      context "propagate variants" do
+        subject { StockLocation.create(name: "testing", propagate_all_variants: false) }
+        let(:stock_item) { subject.propagate_variant(variant) }
+
+        it "creates a new stock item" do
+          expect {
+            subject.propagate_variant(variant)
+          }.to change{ StockItem.count }.by(1)
+        end
+
+        context "passes backorderable default config" do
+          context "true" do
+            before { subject.backorderable_default = true }
+            it { stock_item.backorderable.should be_true }
+          end
+
+          context "false" do
+            before { subject.backorderable_default = false }
+            it { stock_item.backorderable.should be_false }
+          end
+        end
+      end
+
+      context "propagate all variants" do
+        subject { StockLocation.new(name: "testing") }
+
+        context "true" do
+          before { subject.propagate_all_variants = true }
+
+          specify do
+            subject.should_receive(:propagate_variant).at_least(:once)
+            subject.save!
+          end
+        end
+
+        context "false" do
+          before { subject.propagate_all_variants = false }
+
+          specify do
+            subject.should_not_receive(:propagate_variant)
+            subject.save!
+          end
+        end
+      end
     end
 
     it 'finds a stock_item for a variant' do
@@ -113,4 +158,3 @@ module Spree
     end
   end
 end
-
