@@ -13,9 +13,7 @@ module Spree
         order.payment_required?
       }
       go_to_state :confirm, if: ->(order) { order.confirmation_required? }
-      go_to_state :complete, if: ->(order) {
-        (order.payment_required? && order.has_unprocessed_payments?) || !order.payment_required?
-      }
+      go_to_state :complete
       remove_transition from: :delivery, to: :confirm
     end
 
@@ -23,9 +21,8 @@ module Spree
 
     attr_accessible :line_items, :bill_address_attributes, :ship_address_attributes,
                     :payments_attributes, :ship_address, :bill_address, :currency,
-                    :payments_attributes, :line_items_attributes, :number, :email,
-                    :use_billing, :special_instructions, :shipments_attributes,
-                    :coupon_code
+                    :line_items_attributes, :number, :email, :use_billing, 
+                    :special_instructions, :shipments_attributes, :coupon_code
 
     attr_reader :coupon_code
 
@@ -42,8 +39,8 @@ module Spree
     alias_attribute :shipping_address, :ship_address
 
     has_many :state_changes, as: :stateful
-    has_many :line_items, dependent: :destroy, order: 'created_at ASC'
-    has_many :payments, dependent: :destroy
+    has_many :line_items, dependent: :destroy, order: "#{Spree::LineItem.table_name}.created_at ASC"
+    has_many :payments, dependent: :destroy, :class_name => "Spree::Payment"
 
     has_many :shipments, dependent: :destroy do
       def states
@@ -52,7 +49,7 @@ module Spree
     end
 
     has_many :return_authorizations, dependent: :destroy
-    has_many :adjustments, as: :adjustable, dependent: :destroy, order: 'created_at ASC'
+    has_many :adjustments, as: :adjustable, dependent: :destroy, order: "#{Spree::Adjustment.table_name}.created_at ASC"
 
     accepts_nested_attributes_for :line_items
     accepts_nested_attributes_for :bill_address
@@ -168,13 +165,6 @@ module Spree
       payments.map(&:payment_method).compact.any?(&:payment_profiles_supported?)
     end
 
-    # Used by the checkout state machine to check for unprocessed payments
-    # The Order should be unable to proceed to complete if there are unprocessed
-    # payments and there is payment required.
-    def has_unprocessed_payments?
-      payments.with_state('checkout').reload.exists?
-    end
-
     # Indicates the number of items in the order
     def item_count
       line_items.inject(0) { |sum, li| sum + li.quantity }
@@ -260,38 +250,15 @@ module Spree
       @contents ||= Spree::OrderContents.new(self)
     end
 
-    def add_variant(variant, quantity = 1, currency = nil)
-      ActiveSupport::Deprecation.warn("[SPREE] Spree::Order#add_variant will be deprecated in Spree 2.1, please use order.contents.add instead.")
-      contents.currency = currency unless currency.nil?
-      contents.add(variant, quantity)
-    end
-
-    def remove_variant(variant, quantity = 1)
-      ActiveSupport::Deprecation.warn("[SPREE] Spree::Order#remove_variant will be deprecated in Spree 2.1, please use order.contents.remove instead.")
-      contents.remove(variant, quantity)
-    end
-
-    def remove_variant(variant, quantity = 1)
-      current_item = find_line_item_by_variant(variant)
-      current_item.quantity += -quantity
-
-      if current_item.quantity == 0
-        current_item.destroy
-      else
-        current_item.save!
-      end
-
-      self.reload
-      current_item
-    end
-
     # Associates the specified user with the order.
     def associate_user!(user)
       self.user = user
       self.email = user.email
-      # disable validations since they can cause issues when associating
-      # an incomplete address during the address step
-      save(validate: false)
+
+      if persisted?
+        # immediately persist the changes we just made, but don't use save since we might have an invalid address associated
+        self.class.unscoped.where(id: id).update_all(email: user.email, user_id: user.id)
+      end
     end
 
     # FIXME refactor this method and implement validation using validates_* utilities
@@ -303,11 +270,6 @@ module Spree
       end
       self.number = random if self.number.blank?
       self.number
-    end
-
-    def shipment
-      ActiveSupport::Deprecation.warn("[SPREE] Spree::Order#shipment is typically incorrect due to multiple shipments and will be deprecated in Spree 2.1, please process Spree::Order#shipments instead.")
-      @shipment ||= shipments.last
     end
 
     def shipped_shipments
@@ -333,12 +295,6 @@ module Spree
 
     def tax_total
       adjustments.tax.map(&:amount).sum
-    end
-
-    # Clear shipment when transitioning to delivery step of checkout if the
-    # current shipping address is not eligible for the existing shipping method
-    def remove_invalid_shipments!
-      shipments.each { |s| s.destroy unless s.shipping_method.available_to_order?(self) }
     end
 
     # Creates new tax charges if there are any applicable rates. If prices already
@@ -421,8 +377,23 @@ module Spree
       payments.select(&:checkout?)
     end
 
+    # processes any pending payments and must return a boolean as it's
+    # return value is used by the checkout state_machine to determine
+    # success or failure of the 'complete' event for the order
+    #
+    # Returns:
+    # - true if all pending_payments processed successfully
+    # - true if a payment failed, ie. raised a GatewayError
+    #   which gets rescued and converted to TRUE when
+    #   :allow_checkout_gateway_error is set to true
+    # - false if a payment failed, ie. raised a GatewayError
+    #   which gets rescued and converted to FALSE when
+    #   :allow_checkout_on_gateway_error is set to false
+    #
     def process_payments!
-      begin
+      if pending_payments.empty?
+        raise Core::GatewayError.new Spree.t(:no_pending_payments)
+      else
         pending_payments.each do |payment|
           break if payment_total >= total
 
@@ -432,9 +403,10 @@ module Spree
             self.payment_total += payment.amount
           end
         end
-      rescue Core::GatewayError
-        !!Spree::Config[:allow_checkout_on_gateway_error]
       end
+    rescue Core::GatewayError => e
+      result = !!Spree::Config[:allow_checkout_on_gateway_error]
+      errors.add(:base, e.message) and return result
     end
 
     def billing_firstname
@@ -508,10 +480,13 @@ module Spree
     end
 
     # Tells us if there if the specified promotion is already associated with the order
-    # regardless of whether or not its currently eligible.  Useful because generally
-    # you would only want a promotion to apply to order no more than once.
-    def promotion_credit_exists?(promotion)
-      !! adjustments.promotion.reload.detect { |credit| credit.originator.promotion.id == promotion.id }
+    # regardless of whether or not its currently eligible. Useful because generally
+    # you would only want a promotion action to apply to order no more than once.
+    #
+    # Receives an adjustment +originator+ (here a PromotionAction object) and tells
+    # if the order has adjustments from that already
+    def promotion_credit_exists?(originator)
+      !! adjustments.promotion.reload.detect { |credit| credit.originator.id == originator.id }
     end
 
     def promo_total
@@ -544,11 +519,23 @@ module Spree
         return true unless new_record? or state == 'cart'
       end
 
+      def ensure_line_items_present
+        unless line_items.present?
+          errors.add(:base, Spree.t(:there_are_no_items_for_this_order)) and return false
+        end
+      end
+
       def has_available_shipment
         return unless has_step?("delivery")
         return unless address?
         return unless ship_address && ship_address.valid?
         # errors.add(:base, :no_shipping_methods_available) if available_shipping_methods.empty?
+      end
+
+      def ensure_available_shipping_rates
+        if shipments.empty? || shipments.any? { |shipment| shipment.shipping_rates.blank? }
+          errors.add(:base, Spree.t(:items_cannot_be_shipped)) and return false
+        end
       end
 
       def has_available_payment

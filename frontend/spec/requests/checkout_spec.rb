@@ -49,7 +49,7 @@ describe "Checkout" do
         page.should_not have_content("undefined method `promotion'")
 
         click_button "Save and Continue"
-        page.should have_content(shipping_method.name)
+        page.should have_content(shipping_method.adjustment_label)
       end
 
       # Regression test, no issue number
@@ -90,9 +90,9 @@ describe "Checkout" do
       fill_in "Card Code", :with => '123'
       click_button "Save and Continue"
       click_button "Place Order"
-      page.should have_content("Payment could not be processed")
+      page.should have_content("Bogus Gateway: Forced failure")
       click_button "Place Order"
-      page.should have_content("Payment could not be processed")
+      page.should have_content("No pending payments")
     end
   end
 

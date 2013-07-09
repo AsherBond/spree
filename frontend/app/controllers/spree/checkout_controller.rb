@@ -27,7 +27,7 @@ module Spree
         return if after_update_attributes
 
         unless @order.next
-          flash[:error] = Spree.t(:payment_processing_failed)
+          flash[:error] = @order.errors[:base].join("\n")
           redirect_to checkout_state_path(@order.state) and return
         end
 
@@ -127,8 +127,6 @@ module Spree
 
       def before_delivery
         return if params[:order].present?
-
-        @order.create_proposed_shipments
 
         packages = @order.shipments.map { |s| s.to_package }
         @differentiator = Spree::Stock::Differentiator.new(@order, packages)
